@@ -40,6 +40,8 @@ On MiSTer, you must remap your controls in order to bind one of the to the Saves
 
 Tamagotchi will automatically restore where you left off, as a supplement to the savestate functionality. Opening the OSD on MiSTer will cause the core to take a savestate, separate from your 4 manual slots, that will be automatically restored on core launch.
 
+New auto-restored savestates include a MiSTer timestamp. When the core loads a timestamped auto-save, it fast-forwards the emulated Tamagotchi at max speed until the saved state catches up to MiSTer wall time.
+
 ### Turbo
 
 Tamagotchi supports several incremental levels of turbo. These are displayed in the menus and turbo OSD as: `1x`, `2x`, `4x`, `50x`, and `Max`. At the moment, `Max` represents a 1,800x turbo, with the intention of allowing you to quickly evolve your Tamagotchi, or simulate days passing.

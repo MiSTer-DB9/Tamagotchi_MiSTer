@@ -32,6 +32,8 @@ module emu (
     `include "sys/emu_ports.vh"
 );
 
+  import ss_addresses::*;
+
   // Tie pins not being used
   assign ADC_BUS = 'Z;
   assign USER_OUT = '1;
@@ -176,6 +178,7 @@ module emu (
   wire [63:0] img_size;
 
   wire [31:0] joy_unmod;
+  wire [32:0] rtc_timestamp;
 
   wire ss_status_update;
   wire ss_info_req;
@@ -245,7 +248,8 @@ module emu (
 
       .joystick_0(joy_unmod),
 
-      .ps2_key(ps2_key)
+      .ps2_key(ps2_key),
+      .TIMESTAMP(rtc_timestamp)
   );
 
   // If "Savestates" button is pressed, output nothing to rest of core
@@ -286,10 +290,14 @@ module emu (
   wire clk_en_32_768khz;
   wire clk_en_65_536khz;
 
+  wire [2:0] turbo_speed;
+  reg rtc_catchup_active = 0;
+  wire [2:0] clock_turbo_speed = rtc_catchup_active ? 3'h4 : turbo_speed;
+
   clock_divider clock_divider (
       .clk(clk_sys_117_964),
 
-      .turbo_speed(turbo_speed),
+      .turbo_speed(clock_turbo_speed),
 
       .ss_halt(ss_halt),
       .ss_turbo(ss_turbo),
@@ -301,7 +309,6 @@ module emu (
 
   wire reset_turbo;
 
-  wire [2:0] turbo_speed;
   // Represents the turbo value being changed by a "core" mechanic - button press or event reset
   wire show_turbo_ui;
 
@@ -392,6 +399,10 @@ module emu (
       .reset_turbo(reset_turbo)
   );
 
+  wire core_left_button = rtc_catchup_active ? 1'b0 : left_button;
+  wire core_bottom_button = rtc_catchup_active ? 1'b0 : bottom_button;
+  wire core_right_button = rtc_catchup_active ? 1'b0 : right_button;
+
   cpu_6s46 tamagotchi (
       .clk(clk_sys_117_964),
       .clk_en(clk_en_32_768khz),
@@ -400,7 +411,7 @@ module emu (
       .reset(RESET || external_reset || buttons[1] || rom_download || ss_reset),
 
       // Left, middle, right
-      .input_k0({1'b0, ~left_button, ~bottom_button, ~right_button}),
+      .input_k0({1'b0, ~core_left_button, ~core_bottom_button, ~core_right_button}),
 
       .input_k1(4'h0),
 
@@ -417,7 +428,7 @@ module emu (
       .ss_bus_addr(ss_bus_addr),
       .ss_bus_wren(ss_bus_wren),
       .ss_bus_reset(ss_bus_reset || external_reset),
-      .ss_bus_out(ss_bus_out),
+      .ss_bus_out(core_ss_bus_out),
 
       .ss_ready(ss_ready)
   );
@@ -516,6 +527,8 @@ module emu (
 
   wire [16:0] spritesheet_write_addr = ioctl_addr[16:0] + {16'b0, write_spritesheet_high};
   wire [15:0] spritesheet_write_data = write_spritesheet_high ? {8'b0, image_pixel_high} : ioctl_dout;
+  wire [2:0] video_turbo_speed = rtc_catchup_active ? 3'h4 : turbo_speed;
+  wire show_turbo_ui_or_catchup = show_turbo_ui || rtc_catchup_active;
 
   video video (
       .clk(clk_vid_13_107),
@@ -533,8 +546,8 @@ module emu (
       .show_pixel_dividers(lcd_mode != 2),
       .show_pixel_grid_background(lcd_mode == 0),
 
-      .show_turbo_ui(show_turbo_ui),
-      .turbo_speed  (turbo_speed),
+      .show_turbo_ui(show_turbo_ui_or_catchup),
+      .turbo_speed  (video_turbo_speed),
 
       .vsync(vsync),
       .hsync(hsync),
@@ -547,7 +560,7 @@ module emu (
   ///////////////////////////////////////////////
 
   localparam signed [15:0] AUDIO_PIEZO_LEVEL = 16'sh2000;
-  wire audio_enabled = ~disable_sound && turbo_speed < 2;
+  wire audio_enabled = ~disable_sound && ~rtc_catchup_active && turbo_speed < 2;
 
   assign AUDIO_S = 1;
   assign AUDIO_L = audio_enabled ? (buzzer ? AUDIO_PIEZO_LEVEL : -AUDIO_PIEZO_LEVEL) : 16'sd0;
@@ -565,13 +578,20 @@ module emu (
   wire ss_bus_wren;
   wire ss_bus_reset;
   wire [31:0] ss_bus_out;
+  wire [31:0] core_ss_bus_out;
+  wire [31:0] rtc_ss_bus_out;
 
   wire ss_ready;
   wire ss_halt;
   wire ss_begin_reset;
   wire ss_turbo;
 
+  assign ss_bus_out = core_ss_bus_out | rtc_ss_bus_out;
+
   reg begin_save = 0;
+  reg rtc_catchup_save_request = 0;
+  wire auto_savestate_create = begin_save || rtc_catchup_save_request;
+  wire auto_savestate_load = rom_download && img_mounted && img_size > 0;
 
   localparam OSD_SAVE_DELAY = {26{1'b1}};
   reg [25:0] osd_save_timer = 0;
@@ -587,12 +607,108 @@ module emu (
       osd_save_timer <= osd_save_timer - 26'h1;
     end
 
-    if (OSD_STATUS && ~prev_osd && rom_ready && osd_save_timer == 0) begin
+    if (OSD_STATUS && ~prev_osd && rom_ready && osd_save_timer == 0 && ~rtc_catchup_active) begin
       begin_save <= 1;
     end else if (prev_osd && ~OSD_STATUS) begin
       // Enforce min time before another save can occur
       // ~0.5s at 117MHz
       osd_save_timer <= OSD_SAVE_DELAY;
+    end
+  end
+
+  wire [31:0] rtc_wall_timestamp = rtc_timestamp[31:0];
+  wire [31:0] rtc_saved_timestamp;
+
+  reg prev_rtc_timestamp_toggle = 0;
+  reg rtc_wall_timestamp_valid = 0;
+  reg rtc_emulated_timestamp_valid = 0;
+  reg [31:0] rtc_emulated_timestamp = 0;
+  reg [31:0] rtc_catchup_target_timestamp = 0;
+  reg rtc_auto_load_pending = 0;
+  reg prev_ss_begin_reset = 0;
+  reg [14:0] rtc_second_tick_counter = 0;
+
+  wire rtc_saved_timestamp_valid = rtc_saved_timestamp != 32'd0 && rtc_saved_timestamp != 32'hFFFF_FFFF;
+  wire [31:0] rtc_save_timestamp = rtc_emulated_timestamp_valid ? rtc_emulated_timestamp :
+      (rtc_wall_timestamp_valid ? rtc_wall_timestamp : 32'd0);
+
+  bus_connector #(
+      .ADDRESS(SS_TIMESTAMP),
+      .DEFAULT_VALUE(0)
+  ) rtc_timestamp_ss (
+      .clk(clk_sys_117_964),
+
+      .bus_in(ss_bus_in),
+      .bus_addr(ss_bus_addr),
+      .bus_wren(ss_bus_wren),
+      .bus_reset(ss_bus_reset),
+      .bus_out(rtc_ss_bus_out),
+
+      .current_data(rtc_save_timestamp),
+      .new_data(rtc_saved_timestamp)
+  );
+
+  always @(posedge clk_sys_117_964) begin
+    reg starting_savestate_load;
+    reg [31:0] next_emulated_timestamp;
+
+    starting_savestate_load = ss_begin_reset && ~prev_ss_begin_reset;
+    next_emulated_timestamp = rtc_emulated_timestamp + 32'd1;
+
+    rtc_catchup_save_request <= 0;
+    prev_rtc_timestamp_toggle <= rtc_timestamp[32];
+    prev_ss_begin_reset <= ss_begin_reset;
+
+    if (rtc_timestamp[32] != prev_rtc_timestamp_toggle) begin
+      rtc_wall_timestamp_valid <= rtc_wall_timestamp != 32'd0;
+
+      if (~rtc_emulated_timestamp_valid && rtc_wall_timestamp != 32'd0) begin
+        rtc_emulated_timestamp <= rtc_wall_timestamp;
+        rtc_emulated_timestamp_valid <= 1;
+      end
+    end
+
+    if (auto_savestate_load) begin
+      rtc_auto_load_pending <= 1;
+    end
+
+    if (RESET || external_reset || buttons[1]) begin
+      rtc_catchup_active <= 0;
+      rtc_auto_load_pending <= 0;
+      rtc_catchup_save_request <= 0;
+    end else begin
+      if (starting_savestate_load) begin
+        rtc_second_tick_counter <= 0;
+
+        if (rtc_saved_timestamp_valid) begin
+          rtc_emulated_timestamp <= rtc_saved_timestamp;
+          rtc_emulated_timestamp_valid <= 1;
+
+          if (rtc_auto_load_pending && rtc_wall_timestamp_valid && rtc_wall_timestamp > rtc_saved_timestamp) begin
+            rtc_catchup_active <= 1;
+            rtc_catchup_target_timestamp <= rtc_wall_timestamp;
+          end
+        end else if (rtc_auto_load_pending && rtc_wall_timestamp_valid && rtc_wall_timestamp != 32'd0) begin
+          rtc_emulated_timestamp <= rtc_wall_timestamp;
+          rtc_emulated_timestamp_valid <= 1;
+        end
+
+        rtc_auto_load_pending <= 0;
+      end
+
+      if (~starting_savestate_load && clk_en_32_768khz && rom_ready && rtc_emulated_timestamp_valid && ~ss_halt) begin
+        if (rtc_second_tick_counter == 15'h7FFF) begin
+          rtc_second_tick_counter <= 0;
+          rtc_emulated_timestamp <= next_emulated_timestamp;
+
+          if (rtc_catchup_active && next_emulated_timestamp >= rtc_catchup_target_timestamp) begin
+            rtc_catchup_active <= 0;
+            rtc_catchup_save_request <= 1;
+          end
+        end else begin
+          rtc_second_tick_counter <= rtc_second_tick_counter + 15'd1;
+        end
+      end
     end
   end
 
@@ -605,12 +721,12 @@ module emu (
 
       // Triggers
       .manual_start_savestate_create(ss_save),
-      .auto_start_savestate_create(begin_save),
+      .auto_start_savestate_create(auto_savestate_create),
       .manual_start_savestate_load(ss_load),
       // Automatically load once we've downloaded ROM and mounted image
       // `img_mounted` will pulse for ~100 cycles during the end of `rom_download`
       // `img_size` indicates whether or not an actual savestate is present
-      .auto_start_savestate_load(rom_download && img_mounted && img_size > 0),
+      .auto_start_savestate_load(auto_savestate_load),
 
       // SD Saves
       .sd_wr(sd_wr),
