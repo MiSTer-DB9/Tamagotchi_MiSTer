@@ -404,7 +404,7 @@ module emu (
 
   // [MiSTer-DB9 BEGIN] - DB9/SNAC8 support: USB-side joystick + joydb mux
   wire [31:0] joystick_0_USB;
-  wire [31:0] joy_unmod = joydb_1ena ? (OSD_STATUS ? 32'b0 : {16'b0, joydb_1}) : joystick_0_USB;
+  wire [31:0] joy_unmod = joydb_1ena ? (OSD_STATUS ? 32'b0 : joydb_1_mapped[15:0]) : joystick_0_USB;
   // [MiSTer-DB9 END]
 
   wire ss_status_update;
